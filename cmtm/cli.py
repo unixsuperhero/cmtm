@@ -21,7 +21,7 @@ _ALIASES = {
 _PERSISTENT = {"project", "context", "tag"}
 _LIVE = {"window", "session", "host"}
 _BUILTINS = {"json", "settings", "daemon", "launch",
-             "capture", "send", "close", "live", "verbs", "call"}
+             "capture", "send", "close", "verbs", "call"}
 
 
 def _json_object(text: str) -> dict[str, Any]:
@@ -48,11 +48,12 @@ def _globals(parser: argparse.ArgumentParser) -> None:
 
 
 def _parser(prog: str) -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog=prog, description="Start or reuse an isolated TUIOS server, open a new UI window, and attach.",
+    parser = argparse.ArgumentParser(prog=prog, description="Resume the existing isolated UI, or start a new server and UI when none exists.",
         epilog="Unknown commands execute <invoked-name>-<command> from PATH. Put application global options before the command; external arguments are forwarded literally.")
     _globals(parser)
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument("--internal-ui", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--internal-ui-hosted", action="store_true", help=argparse.SUPPRESS)
     commands = parser.add_subparsers(dest="command")
     viewer = commands.add_parser("json", help="explore JSON interactively; file, '-' for stdin, or a native picker")
     viewer.add_argument("file", nargs="?")
@@ -135,8 +136,6 @@ def _parser(prog: str) -> argparse.ArgumentParser:
     close = commands.add_parser("close", help="explicitly close one daemon window")
     close.add_argument("id")
     close.add_argument("--yes", action="store_true", help="confirm closure")
-    live = commands.add_parser("live", help="explicit live interaction with one stable window target")
-    live.add_argument("id")
     return parser
 
 
@@ -315,7 +314,7 @@ def _execute(services: Any, args: argparse.Namespace) -> Any:
     command = args.command
     if args.internal_ui:
         from .ui import run
-        run(services)
+        run(services, daemon_hosted=args.internal_ui_hosted)
         return None
     if command == "json":
         _json_view(services, args.file)
@@ -328,7 +327,7 @@ def _execute(services: Any, args: argparse.Namespace) -> Any:
         argv = [sys.executable, *entry, "--server", args.server]
         if args.database:
             argv.extend(("--database", str(Path(args.database).expanduser().resolve())))
-        argv.append("--internal-ui")
+        argv.extend(("--internal-ui", "--internal-ui-hosted"))
         result = services.daemon.bootstrap(argv)
         services.daemon.live(result, leader="ctrl+g")
         return None
@@ -399,9 +398,6 @@ def _execute(services: Any, args: argparse.Namespace) -> Any:
         _confirm(args.yes, f"Close window {target['label']} ({args.id}) on {args.server}?")
         services.daemon.close_window(target)
         return {"closed": args.id, "server": args.server}
-    if command == "live":
-        services.daemon.live(target)
-        return None
     raise ValueError(f"unsupported command: {command}")
 
 
@@ -450,6 +446,8 @@ def main(argv: list[str] | None = None) -> int:
         args.machine = global_args.machine
         if args.internal_ui and args.command is not None:
             parser.error("--internal-ui cannot be combined with a command")
+        if args.internal_ui_hosted and not args.internal_ui:
+            parser.error("--internal-ui-hosted requires --internal-ui")
         with open_services(server=args.server, database=args.database) as services:
             result = _execute(services, args)
         if result is not None:

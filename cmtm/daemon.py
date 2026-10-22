@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import copy
 from collections import deque
+from contextlib import contextmanager
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -460,12 +462,54 @@ class Daemon:
             raise DaemonError(f"Cannot create private TUIOS startup config: {error}", code="isolation") from error
         return {**self.environment, "XDG_CONFIG_HOME": str(root), "XDG_CONFIG_DIRS": str(root)}
 
+    @contextmanager
+    def _startup_lock(self):
+        """Serialize cold-start and manager creation across cmtm processes."""
+        descriptor = None
+        try:
+            for directory in (self.socket_path.parents[2], self.socket_path.parents[1],
+                              self.socket_path.parent):
+                directory.mkdir(mode=0o700, exist_ok=True)
+                info = directory.lstat()
+                if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid()
+                        or stat.S_IMODE(info.st_mode) != 0o700):
+                    raise DaemonError(f"Startup requires a private user-owned directory: {directory}", code="isolation")
+            descriptor = os.open(self.socket_path.parent / "cmtm-start.lock",
+                                 os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+            info = os.fstat(descriptor)
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                    or stat.S_IMODE(info.st_mode) != 0o600):
+                raise DaemonError("The cmtm startup lock must be a private user-owned file.", code="isolation")
+            deadline = time.monotonic() + 30
+            while True:
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise DaemonError("Another cmtm startup is still in progress; wait for it to finish and retry.", code="timeout")
+                    time.sleep(0.05)
+            yield
+        except OSError as error:
+            raise DaemonError(f"Cannot lock named-server startup: {error}", code="isolation") from error
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+
     def start(self):
         """Start or reuse only this server; no resources are killed on exit."""
+        with self._startup_lock():
+            return self._start()
+
+    def _start(self):
+        """The caller holds the startup lock through any manager creation."""
         try:
-            return self.call("hello", {"client": "cmtm", "protocol": 1})
+            return {**self.call("hello", {"client": "cmtm", "protocol": 1}), "started": False}
         except DaemonError as error:
-            if error.code != "disconnected":
+            if (error.code != "disconnected"
+                    or not isinstance(error.__cause__, (FileNotFoundError, ConnectionRefusedError))):
+                # A timeout, permission failure or broken protocol does not
+                # establish that this named daemon is absent.
                 raise
         environment = self._prepare_start_config()
         # `new --detach` is TUIOS's supported bounded startup path. The initial
@@ -480,8 +524,8 @@ class Daemon:
                 result = self.call("hello", {"client": "cmtm", "protocol": 1})
             except DaemonError:
                 raise error
-            return {**result, "start_note": str(error)}
-        return self.call("hello", {"client": "cmtm", "protocol": 1})
+            return {**result, "start_note": str(error), "started": False}
+        return {**self.call("hello", {"client": "cmtm", "protocol": 1}), "started": True}
 
     def close(self):
         self._closed.set()
@@ -744,17 +788,47 @@ class Daemon:
                 record["fields"].update(prompt_status=error.outcome, prompt_error=str(error))
         return record
 
+    def _existing_manager(self):
+        sessions = self.call("list-sessions").get("sessions", [])
+        session = next((item for item in sessions if item.get("name") == "mtm-only"), None)
+        managers = []
+        if session is not None:
+            for window in self.call("list-windows", {"session": "mtm-only"}).get("windows", []):
+                name = window.get("custom_name") or window.get("name") or window.get("display_name")
+                pid = window.get("pid")
+                if name != "Matomeru" or not isinstance(pid, int) or pid <= 0 or window.get("host") not in (None, "", "local"):
+                    continue
+                try:
+                    os.kill(pid, 0)
+                except OSError:
+                    continue
+                managers.append(window)
+        if len(managers) != 1:
+            problem = "no live Matomeru manager" if not managers else "multiple live Matomeru managers"
+            raise DaemonError(
+                f"Server {self.server} is already running but has {problem} in mtm-only. "
+                "No window was created or moved. Inspect it with "
+                f"'tuios --server {self.server} list-windows --session mtm-only --json'. "
+                "Use 'cmtm --internal-ui' for a separate direct UI, or, only after saving all work, "
+                "explicitly stop this named server and launch cmtm again.",
+                code="manager_missing" if not managers else "manager_ambiguous")
+        record = self._window_record(managers[0], "mtm-only", session.get("id", session.get("session_id", "")))
+        record["fields"].update(pane_kind="ui", kind="ui", project="no-project")
+        return record
+
     def bootstrap(self, argv):
         if not isinstance(argv, list) or not argv or any(not isinstance(arg, str) or "\0" in arg for arg in argv):
             raise DaemonError("UI bootstrap requires a nonempty argv list.", code="invalid_params")
-        self.start()
-        session, sid, workspace = self._placement("mtm-only", str(Path.home()), ui=True)
-        result = self.call("new-window", {"session": session, "name": "Matomeru", "command": self._pane_command(argv),
-                                          "workspace": workspace, "focus": False, "cwd": str(Path.home()),
-                                          "close_on_exit": True})
-        record = self._window_record(result, session, sid)
-        record["fields"].update(pane_kind="ui", kind="ui", project="no-project")
-        return record
+        with self._startup_lock():
+            if not self._start()["started"]:
+                return self._existing_manager()
+            session, sid, workspace = self._placement("mtm-only", str(Path.home()), ui=True)
+            result = self.call("new-window", {"session": session, "name": "Matomeru", "command": self._pane_command(argv),
+                                              "workspace": workspace, "focus": False, "cwd": str(Path.home()),
+                                              "close_on_exit": True})
+            record = self._window_record(result, session, sid)
+            record["fields"].update(pane_kind="ui", kind="ui", project="no-project")
+            return record
 
     def close_window(self, target):
         return self.call("close-window", self._target(target))
@@ -877,20 +951,63 @@ class Daemon:
                 process.kill()
                 process.wait(timeout=2)
 
-    def live(self, target, cols=None, rows=None, leader="ctrl+a"):
-        """Run the real named-server pane-view client on a detail-sized PTY.
+    def _detach_path(self, window):
+        # Stable window IDs are encoded, never interpreted as filesystem paths.
+        return self.socket_path.parent / ("cmtm-detach-" + quote(str(window), safe=""))
 
-        The caller suspends curses. pane-view owns stream/input/renewable lease;
-        ending only that viewer releases the lease without closing the target.
-        Return next/previous so the UI can select a stable new target before it
-        starts another stream. Escape and Ctrl+Z are ordinary target input.
+    @staticmethod
+    def _detach_generation(path):
+        try:
+            descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        except FileNotFoundError:
+            return b""
+        try:
+            info = os.fstat(descriptor)
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                    or stat.S_IMODE(info.st_mode) != 0o600):
+                raise DaemonError("The UI detach token must be a private user-owned file.", code="isolation")
+            return os.read(descriptor, 65)
+        finally:
+            os.close(descriptor)
+
+    def request_ui_detach(self):
+        """Detach current viewers of this shared UI without exiting its process."""
+        window = os.environ.get("TUIOS_WINDOW_ID") or os.environ.get("TUIOS_PANE_ID")
+        if (not window or os.environ.get("TUIOS_SERVER") != self.server
+                or os.environ.get("TUIOS_SOCKET") != str(self.socket_path)):
+            raise DaemonError("UI detach requires the manager's named-server pane identity.", code="isolation")
+        current = self.call("get-window", {"session": "mtm-only", "window": window})
+        if str(current.get("pid")) != str(os.getpid()):
+            raise DaemonError("UI detach refused: this process is not the manager pane.", code="isolation")
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(dir=self.socket_path.parent, prefix=".cmtm-detach-", delete=False) as output:
+                temporary = Path(output.name)
+                os.fchmod(output.fileno(), 0o600)
+                output.write(os.urandom(32).hex().encode("ascii"))
+            os.replace(temporary, self._detach_path(window))
+        except OSError as error:
+            raise DaemonError(f"Cannot request UI detach: {error}") from error
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+        return {"action": "detach", "window": window}
+
+    def live(self, target, leader="ctrl+g"):
+        """View the existing manager across the whole terminal.
+
+        TUIOS owns the renewable sizing lease; terminal resizes change only the
+        view dimensions, never the manager's selection or navigation state.
+        The manager supplies all borders, status and help. The outer client
+        handles only its detach prefix, leaving ordinary keys to the UI.
         """
-        import fcntl
         import pty
         import termios
         import tty
 
         params = self._target(target)
+        if params["session"] != "mtm-only" or target.get("fields", {}).get("pane_kind") != "ui":
+            raise DaemonError("The outer viewer only attaches the cmtm manager; open terminals and agents inside its Live pane.", code="invalid_params")
         if not sys.stdin.isatty() or not sys.stdout.isatty():
             raise DaemonError("Live interaction needs a terminal on stdin and stdout.", code="unavailable")
         self.call("get-window", params)  # Refuse absent server/window, never autostart.
@@ -901,11 +1018,13 @@ class Daemon:
         else:
             raise DaemonError("Live leader must be Ctrl+a through Ctrl+z.", code="invalid_params")
         size = os.get_terminal_size(sys.stdout.fileno())
-        cols = max(1, min(int(cols or size.columns), 4096))
-        rows = max(1, min(int(rows or max(1, size.lines - 2)), 4096))
+        cols = max(1, min(size.columns, 4096))
+        rows = max(1, min(size.lines, 4096))
         executable = shutil.which("tuios", path=self.environment.get("PATH"))
         if not executable:
             raise DaemonError("tuios is not installed on PATH.", code="unavailable")
+        detach_path = self._detach_path(params["window"])
+        detach_generation = self._detach_generation(detach_path)
         master, slave = pty.openpty()
         process = None
         saved = termios.tcgetattr(sys.stdin.fileno())
@@ -916,7 +1035,7 @@ class Daemon:
         try:
             fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
             process = subprocess.Popen([executable, "--server", self.server, "pane-view", "--session", params["session"],
-                                        "--window", params["window"], "--size", "pane"],
+                                        "--window", params["window"], "--size", "follow"],
                                        stdin=slave, stdout=slave, stderr=slave, env=self.environment,
                                        start_new_session=True, close_fds=True)
             self._live_process = process
@@ -925,14 +1044,16 @@ class Daemon:
             tty.setraw(sys.stdin.fileno())
             os.write(sys.stdout.fileno(), b"\x1b[2J\x1b[H")
 
-            def notice(text):
-                line = min(rows + 1, size.lines)
-                message = _plain(text).replace("\n", " ")[:size.columns]
-                os.write(sys.stdout.fileno(), f"\x1b7\x1b[{line};1H\x1b[0m\x1b[2K{message}\x1b8".encode())
-
-            notice(f"LIVE {self.server}/{params['session']}/{params['window'][:8]} | {leader}: d detach, n/p switch, z zoom, ? help")
             detached = False
             while not self._closed.is_set() and not detached:
+                if self._detach_generation(detach_path) != detach_generation:
+                    break
+                size = os.get_terminal_size(sys.stdout.fileno())
+                dimensions = max(1, min(size.columns, 4096)), max(1, min(size.lines, 4096))
+                if dimensions != (cols, rows):
+                    cols, rows = dimensions
+                    # pane-view polls its PTY size and updates its own lease.
+                    fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
                 ready, _, _ = select.select([master, sys.stdin.fileno()], [], [], 0.2)
                 if master in ready:
                     try:
@@ -955,21 +1076,11 @@ class Daemon:
                             pending = False
                             if byte == leader_byte:
                                 forward.append(byte)
-                            elif byte in (ord("d"), ord("n"), ord("p")):
-                                action = {ord("d"): "detach", ord("n"): "next", ord("p"): "previous"}[byte]
+                            elif byte == ord("d"):
                                 detached = True
                                 break
-                            elif byte in (ord("?"), ord("h")):
-                                notice(f"{leader} then d detach; n/p next/previous; z TUIOS zoom; double leader sends literal. Esc/Ctrl+Z go to pane.")
-                            elif byte == ord("z"):
-                                try:
-                                    self.call("focus-window", params)
-                                    self.call("run-command", {"session": params["session"], "command": "ToggleZoom"})
-                                    notice("TUIOS zoom requested for selected pane.")
-                                except DaemonError as error:
-                                    notice(str(error))
                             else:
-                                notice("Unknown live leader key consumed; leader ? shows help.")
+                                os.write(sys.stdout.fileno(), b"\a")
                         elif byte == leader_byte:
                             pending = True
                         else:

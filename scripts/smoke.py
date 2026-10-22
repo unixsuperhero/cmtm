@@ -143,12 +143,14 @@ def main():
             sample = root / "example.json"
             sample.write_text('{"items": [{"message": "JSON acceptance"}], "enabled": true}')
             ui_acceptance(base + ["json", str(sample)], env, root, json_mode=True)
-            second_manager = startup_acceptance(base, env, daemon, detach=False)
-            assert second_manager["id"] != manager["id"], "Repeated launch reused an old UI"
+            second_manager = startup_acceptance(base, env, daemon, detach=False, expected=manager, live_target=target)
+            assert second_manager["id"] == manager["id"], "Repeated launch replaced the running UI"
             survivors = {row["id"] for row in daemon.snapshot()}
             assert manager["id"] in survivors and target["id"] in survivors, "Client exit closed unrelated managed windows"
+            startup_acceptance(base, env, daemon, detach=True, expected=manager)
             daemon.close_window(manager)
-            print("PASS plain startup, new UI on reuse, detach/quit and daemon survival", flush=True)
+            startup_acceptance(base, env, daemon, detach=False, missing=True)
+            print("PASS cold startup, same UI/inventory/Context resume, hosted q, later reattach and full-screen frame", flush=True)
             daemon.close_window(target)
             assert not any(row["id"] == target["id"] for row in daemon.snapshot()), "Closed target remains live"
             print("PASS explicit target closure", flush=True)
@@ -158,7 +160,17 @@ def main():
     print("ACCEPTANCE PASS", flush=True)
 
 
-def startup_acceptance(base, env, daemon, *, detach):
+def assert_frame(screen, *, live=False):
+    lines = screen.splitlines()
+    assert len(lines) == 28, f"Frame must fill all 28 terminal rows: {screen}"
+    assert all(len(line) == 100 for line in lines), f"Frame must fill all 100 terminal columns: {screen}"
+    assert all(line.startswith("+") and line.endswith("+") for line in (lines[0], lines[-1])), screen
+    assert "cmtm" in lines[0] and "cmtm" in lines[-1], screen
+    assert all(line.startswith("|") and line.endswith("|") for line in lines[1:-1]), screen
+    assert ("LIVE" if live else "NORMAL") in lines[-1], screen
+
+
+def startup_acceptance(base, env, daemon, *, detach, expected=None, missing=False, live_target=None):
     import fcntl
     import pty
     import select
@@ -169,7 +181,7 @@ def startup_acceptance(base, env, daemon, *, detach):
         previous = {row["id"] for row in daemon.snapshot()}
     except Exception:
         previous = set()
-    if detach:
+    if expected is None and not missing:
         assert not previous, "Noninteractive/data commands unexpectedly started the daemon"
     master, slave = pty.openpty()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 28, 100, 0, 0))
@@ -178,6 +190,24 @@ def startup_acceptance(base, env, daemon, *, detach):
     output = bytearray()
     manager = None
     screen = ""
+
+    def observe(*markers, live=False):
+        deadline = time.monotonic() + 8
+        screen = ""
+        while time.monotonic() < deadline:
+            if select.select([master], [], [], 0.05)[0]:
+                try:
+                    output.extend(os.read(master, 65536))
+                except OSError:
+                    break
+            if process.poll() is not None:
+                break
+            screen = daemon.capture(manager, cols=100, rows=28)
+            if all(marker in screen for marker in markers):
+                assert_frame(screen, live=live)
+                return screen
+        raise AssertionError(f"Managed UI did not render {markers}: {screen}\n{bytes(output[-4000:])!r}")
+
     try:
         deadline = time.monotonic() + 12
         while time.monotonic() < deadline:
@@ -190,26 +220,61 @@ def startup_acceptance(base, env, daemon, *, detach):
                 break
             try:
                 rows = daemon.snapshot()
-                fresh = [row for row in rows if row["kind"] == "window" and row["id"] not in previous and row["fields"].get("session") == "mtm-only"]
-                if fresh:
-                    assert len(fresh) == 1, "Default launch recursively created UI windows"
-                    manager = fresh[0]
+                managers = [row for row in rows if row["kind"] == "window" and row["fields"].get("session") == "mtm-only"]
+                if managers:
+                    assert not missing, "Running daemon with no UI unexpectedly created a replacement"
+                    assert len(managers) == 1, "Default launch created duplicate UI windows"
+                    manager = managers[0]
+                    if expected is not None:
+                        assert manager["id"] == expected["id"], "Resume selected a different UI"
+                        assert {row["id"] for row in rows} == previous, "Resume changed daemon inventory"
                     screen = daemon.capture(manager, cols=100, rows=28)
-                    if "manager placement: verified mtm-only" in screen and "current last OK" in screen and b"ctrl+g" in output:
+                    frame = screen.splitlines()
+                    if ("manager placement: verified mtm-only" in screen and "current last OK" in screen
+                            and len(frame) == 28 and len(frame[0]) == 100):
                         break
             except Exception as exc:
                 if isinstance(exc, AssertionError):
                     raise
-        assert manager is not None and "manager placement: verified mtm-only" in screen and "current last OK" in screen and b"ctrl+g" in output, (screen, bytes(output[-4000:]))
+        if missing:
+            process.wait(timeout=5)
+            assert process.returncode != 0, "Missing manager was silently accepted"
+            assert b"has no live Matomeru manager" in output, bytes(output[-4000:])
+            assert {row["id"] for row in daemon.snapshot()} == previous, "Missing-manager startup mutated inventory"
+            print("PASS running daemon with missing UI refuses without creating windows", flush=True)
+            return None
+        assert manager is not None and "manager placement: verified mtm-only" in screen and "current last OK" in screen, (screen, bytes(output[-4000:]))
+        assert_frame(screen)
+        inventory = {row["id"] for row in daemon.snapshot()}
         print("DEFAULT STARTUP SCREEN\n" + screen, flush=True)
+        if expected is None:
+            os.write(master, b"3")
+            screen = observe("[3:Context]", "Durable context")
+        assert "[3:Context]" in screen and "Durable context" in screen, "UI page/selection did not survive resume: " + screen
+        if live_target is not None:
+            os.write(master, b"1g")
+            observe("[1:Panes]", "Read-only screen", "acceptance [window]")
+            os.write(master, b"i")
+            observe("LIVE screen", "ctrl+a d", live=True)
+            marker = "FRAMED_LIVE_" + secrets.token_hex(4)
+            os.write(master, ("printf '%s%s\\n' '" + marker[:8] + "' '" + marker[8:] + "'\r").encode())
+            screen = observe("LIVE screen", marker, live=True)
+            assert marker in daemon.capture(live_target), "Framed live input reached the wrong target"
+            (ROOT / "acceptance-live-screen.txt").write_text(screen)
+            print("EMBEDDED LIVE SCREEN\n" + screen, flush=True)
+            os.write(master, b"\x01d")
+            observe("NORMAL", "Read-only screen")
+            os.write(master, b"3")
+            screen = observe("[3:Context]", "Durable context")
+        (ROOT / "acceptance-manager-screen.txt").write_text(screen)
         os.write(master, b"\x07d" if detach else b"q")
         process.wait(timeout=8)
         assert process.returncode == 0, bytes(output[-4000:])
         rows = daemon.snapshot()
-        if detach:
-            assert any(row["id"] == manager["id"] for row in rows), "Detach closed the UI window"
-        else:
-            assert not any(row["id"] == manager["id"] for row in rows), "Quitting left the manager window running"
+        assert any(row["id"] == manager["id"] for row in rows), "Client quit/detach closed the persistent UI"
+        assert {row["id"] for row in rows} == inventory, "Client quit/detach changed daemon inventory"
+        screen = daemon.capture(manager, cols=100, rows=28)
+        assert "[3:Context]" in screen and "Durable context" in screen, "Detach lost Context state"
         return manager
     finally:
         if process.poll() is None:
@@ -299,6 +364,8 @@ def ui_acceptance(base, env, root, json_mode=False):
                 process.wait(timeout=3)
         os.close(master)
         (ROOT / ("acceptance-json.ansi" if json_mode else "acceptance-tui.ansi")).write_bytes(output)
+        if json_mode:
+            assert b"cmtm" in output, "JSON explorer omitted the application frame"
 
 
 if __name__ == "__main__":

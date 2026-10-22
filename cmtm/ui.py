@@ -124,11 +124,12 @@ class Modal:
 class Application:
     PAGES = ('Panes', 'Projects', 'Context', 'Sessions', 'Hosts', 'Settings')
 
-    def __init__(self, screen, services, json_data=None):
+    def __init__(self, screen, services, json_data=None, *, daemon_hosted=False):
         self.screen, self.services = screen, services
         self.store, self.daemon = services.store, services.daemon
         self.settings = dict(services.settings)
         self.json_mode = json_data is not None
+        self.daemon_hosted = daemon_hosted and not self.json_mode
         self.json_data = None if json_data is JSON_NULL else json_data
         self.pages = ('JSON',) if self.json_mode else self.PAGES
         self.page = self.pages[0]
@@ -254,7 +255,7 @@ class Application:
                 same_boundary = os.environ.get('TUIOS_SERVER') == self.daemon.server and os.environ.get('TUIOS_SOCKET') == str(getattr(self.daemon, 'socket_path', ''))
                 verified = same_boundary and any(record['kind'] == 'window' and record.get('fields', {}).get('window') == inherited_window
                     and record['fields'].get('session') == 'mtm-only' and str(record['fields'].get('pid')) == str(os.getpid()) for record in records)
-                self.placement = 'manager placement: verified mtm-only' if verified else 'standalone/unverified; run cmtm to open a managed UI'
+                self.placement = 'manager placement: verified mtm-only' if verified else 'standalone/unverified; run cmtm to resume the managed UI'
                 self.last_success = time.time()
                 self.connection = 'current'
                 self.revision += 1
@@ -362,8 +363,7 @@ class Application:
             return
         self.preview_requested = now
         generation = self.preview_generation
-        height, width = self.screen.getmaxyx()
-        cols, rows = max(10, width // 2 - 3), max(2, height - 12)
+        cols, rows = self.capture_size()
         old = self.preview.get(identity)
         if old is None:
             self.preview[identity] = {'text': '', 'state': 'loading', 'time': None}
@@ -409,11 +409,79 @@ class Application:
             self.inspection[key] = {'text': error or json.dumps(value, ensure_ascii=False, indent=2), 'at': time.monotonic()}
         self.submit_io('inspect', lambda: self.daemon.inspect(target, tab=tab), received)
 
-    def put(self, y, x, text, width=None, attr=0):
-        h, w = self.screen.getmaxyx()
-        if y < 0 or y >= h or x < 0 or x >= w:
+    def viewport(self):
+        """Logical UI coordinates exclude the persistent outer frame."""
+        height, width = self.screen.getmaxyx()
+        return max(0, height - 2), max(0, width - 2)
+
+    @staticmethod
+    def detail_left(width):
+        return max(20, min(width // 2, 56)) if width >= 60 else 0
+
+    @staticmethod
+    def capture_offset(height, tab='Screen'):
+        if height < 8:
+            return 1
+        return 5 if tab == 'Screen' else max(5, height // 2 + 1)
+
+    def capture_size(self, *, live=False):
+        height, width = self.viewport()
+        body_height = max(0, height - 5)
+        if not live and self.modals and self.modals[-1].mode in ('jump', 'context', 'project-context'):
+            return max(1, width - max(12, width // 2)), max(1, body_height - 3)
+        detail_height = max(0, body_height - 1)
+        tab = 'Screen' if live else self.states[self.page].tab
+        return max(1, width - self.detail_left(width)), max(1, detail_height - self.capture_offset(detail_height, tab) - 1)
+
+    def mode_label(self):
+        if self.live_target or self.live_transition:
+            return 'LIVE'
+        if self.confirm:
+            return 'CONFIRM'
+        if self.form:
+            return 'EDIT' if self.form.editing else 'FORM'
+        if self.searching or self.modals and self.modals[-1].searching:
+            return 'SEARCH'
+        return self.modals[-1].mode.upper() if self.modals else 'NORMAL'
+
+    def detach_hint(self):
+        quit_hint = f'{self.binding_for("ui.quit")} {"detach viewers" if self.daemon_hosted else "quit"}'
+        if self.live_target or self.live_transition:
+            quit_hint = f'{self.settings.get("live_leader", "ctrl+a")} d back; then {quit_hint}'
+        return ('ctrl+g d detach viewer | ' if self.daemon_hosted else '') + quit_hint
+
+    def render_frame(self):
+        height, width = self.screen.getmaxyx()
+        if not height or not width:
             return
-        text = crop(text, max(0, min(w - x - (1 if y == h - 1 else 0), width if width is not None else w - x)))
+        attr = curses.A_BOLD
+        if self.settings.get('color', True) and curses.has_colors():
+            attr |= curses.color_pair(1)
+        def edge(y, x, text):
+            try:
+                self.screen.addstr(y, x, text, attr)
+            except curses.error:
+                # Curses may report ERR after painting the bottom-right cell.
+                pass
+        if width == 1:
+            for y in range(height):
+                edge(y, 0, '|')
+            return
+        for y in range(1, height - 1):
+            edge(y, 0, '|')
+            edge(y, width - 1, '|')
+        title = ' cmtm | terminal & agent workspace ' if not self.json_mode else ' cmtm | JSON explorer '
+        footer = f' cmtm | {self.mode_label()} | {self.detach_hint()} '
+        for y, label in ((0, title), (height - 1, footer)):
+            text = crop(label, width - 2)
+            edge(y, 0, '+' + text + '-' * (width - 2 - cell_width(text)) + '+')
+
+    def put(self, y, x, text, width=None, attr=0):
+        h, w = self.viewport()
+        top, bottom = getattr(self, '_content_clip', (0, h))
+        if y < top or y >= bottom or y >= h or x < 0 or x >= w:
+            return
+        text = crop(text, max(0, min(w - x, width if width is not None else w - x)))
         if self.settings.get('color', True) and curses.has_colors():
             if y == 0:
                 attr |= curses.color_pair(1)
@@ -422,7 +490,7 @@ class Application:
             elif y == h - 3 and text:
                 attr |= curses.color_pair(3 if any(word in text.lower() for word in ('failed', 'error', 'refused', 'unavailable')) else 2)
         try:
-            self.screen.addstr(y, x, text, attr)
+            self.screen.addstr(y + 1, x + 1, text, attr)
         except curses.error:
             pass
 
@@ -433,24 +501,31 @@ class Application:
         for i, line in enumerate(visible):
             rendered = line[horizontal:]
             overflow = cell_width(rendered) > width
-            self.put(y + i, x, crop(rendered, max(0, width - 1)) + ('>' if overflow else ''), width)
+            self.put(y + i, x, crop(rendered, max(0, width - (1 if overflow else 0))) + ('>' if overflow else ''), width)
         if len(source) > offset + height and height > 0:
             self.put(y + height - 1, x + max(0, width - 18), f'v {offset + height}/{len(source)}', min(width, 18), curses.A_DIM)
 
     def render(self):
         self.screen.erase()
-        h, w = self.screen.getmaxyx()
+        h, w = self.viewport()
+        self._content_clip = (0, h)
         if h < 6 or w < 24:
-            self.put(0, 0, 'Terminal too small (24x6 minimum)')
-            self.put(1, 0, f'{self.page} | {self.connection}')
-            self.put(h - 1, 0, 'Resize; q quits; ? help')
+            self.put(0, 0, 'cmtm: resize (26x8 minimum)', w, curses.A_BOLD)
+            self.put(1, 0, f'server:{self.daemon.server}', w)
+            self.put(2, 0, f'connection:{self.connection}', w)
+            session = 'mtm-only' if self.daemon_hosted else 'JSON' if self.json_mode else 'standalone'
+            self.put(3, 0, f'session:{session}', w)
+            self.put(4, 0, self.detach_hint(), w)
+            self.render_frame()
             self.screen.refresh()
             return
         page_text = ' '.join(f'[{i + 1}:{page}]' if page == self.page else f'{i + 1}:{page}' for i, page in enumerate(self.pages))
-        self.put(0, 0, 'cmtm | ' + page_text, w, curses.A_BOLD)
+        self.put(0, 0, page_text, w, curses.A_BOLD)
         attention = sum(bool(r.get('fields', {}).get('unread') or r.get('fields', {}).get('needs_input') or r.get('fields', {}).get('blocked')) for r in self.inventory)
         age = '' if self.last_success is None else f' last OK {int(time.time() - self.last_success)}s ago'
-        self.put(1, 0, f'{self.daemon.server} | {self.connection}{age} | attention {attention}', w, curses.A_DIM)
+        session = 'mtm-only' if self.daemon_hosted else 'JSON' if self.json_mode else 'standalone'
+        self.put(1, 0, f'server:{self.daemon.server} | session:{session} | connection:{self.connection}{age} | attention {attention}', w, curses.A_DIM)
+        self._content_clip = (2, h - 3)
         self.render_main(2, h - 5, w)
         if self.modals:
             self.render_modal(2, h - 5, w)
@@ -460,6 +535,7 @@ class Application:
             self.put(h // 2 - 1, 1, ' ' * (w - 2), w - 2, curses.A_REVERSE)
             self.put(h // 2, 1, self.confirm[0], w - 2, curses.A_REVERSE)
             self.put(h // 2 + 1, 1, 'y / Enter: confirm    n / Escape: cancel', w - 2, curses.A_REVERSE)
+        self._content_clip = (0, h)
         message = self.status or ('; '.join(self.binding_errors))
         self.put(h - 3, 0, message, w, curses.A_BOLD)
         if self.form:
@@ -470,12 +546,13 @@ class Application:
             help_line = self.help_footer()
         self.put(h - 2, 0, help_line, w, curses.A_DIM)
         self.put(h - 1, 0, self.input_status(), w)
+        self.render_frame()
         self.screen.refresh()
 
     def help_footer(self):
-        wanted = ('ui.help', 'ui.palette', 'ui.jump', 'ui.context', 'ui.group', 'ui.group_config', 'ui.live')
+        wanted = ('ui.quit', 'ui.help', 'ui.palette', 'ui.jump', 'ui.context', 'ui.group', 'ui.group_config', 'ui.live')
         reverse = {action: key for key, action in self.bindings.items()}
-        return 'j/k move | h/l area | ' + ' | '.join(f'{reverse[a]} {concepts.ACTIONS[a]["label"]}' for a in wanted if a in reverse)
+        return self.detach_hint() + ' | j/k move | h/l area | ' + ' | '.join(f'{reverse[a]} {self.action_metadata(a)["label"]}' for a in wanted if a in reverse and a != 'ui.quit')
 
     def input_status(self):
         if self.live_target or self.live_transition:
@@ -492,6 +569,8 @@ class Application:
         return f'{count}/{total} sort:{state.sort}{" desc" if state.descending else ""} group:{",".join(state.group_by) or "none"} scope:{",".join(map(str, state.group_scope)) or "all"} filters:{state.filters or "none"}'
 
     def render_list(self, rows, state, y, x, height, width):
+        if height <= 0 or width <= 0:
+            return
         state.current(rows)
         if not rows:
             self.put(y, x, 'No matching items (clear filters with \\)', width, curses.A_DIM)
@@ -541,40 +620,44 @@ class Application:
         rows = state.rows(records, self.revision)
         selected = state.current(rows)
         self.put(y, 0, self.list_summary(state, len(rows), len(records)), width, curses.A_DIM)
-        left = max(20, min(width // 2, 56))
+        left = self.detail_left(width)
         if width < 60:
             if not self.focus_detail and not self.opened:
-                self.render_list(rows, state, y + 1, 0, max(1, height - 1), width)
+                self.render_list(rows, state, y + 1, 0, max(0, height - 1), width)
                 return
             left = 0
         else:
-            self.render_list(rows, state, y + 1, 0, max(1, height - 1), left - 1)
+            self.render_list(rows, state, y + 1, 0, max(0, height - 1), left - 1)
             for line in range(y + 1, y + height):
                 self.put(line, left - 1, '|', 1, curses.A_DIM)
-        self.render_detail(self.opened or selected, state, y + 1, left, max(1, height - 1), width - left)
+        self.render_detail(self.opened or selected, state, y + 1, left, max(0, height - 1), width - left)
 
     def render_detail(self, record, state, y, x, height, width):
+        if height <= 0 or width <= 0:
+            return
         if not record:
             self.lines('No selection.\nUse New actions or start the isolated server.\nDisconnected inventory is retained, never treated as deletion.', y, x, height, width)
             return
         fields = record.get('fields', {})
         self.put(y, x, f'{record["label"]} [{record["kind"]}]', width, curses.A_BOLD)
         if record['kind'] == 'window':
-            self.put(y + 1, x, ' | '.join(f'[{tab}]' if state.tab == tab else tab for tab in DETAIL_TABS), width)
-            self.put(y + 2, x, f'{fields.get("server", self.daemon.server)}/{fields.get("host", "?")}/{fields.get("session", "?")}/{fields.get("window", record["id"])}', width, curses.A_DIM)
-            self.put(y + 3, x, f'project:{self.project_name(record.get("project_id"))} state:{fields.get("state", "unknown")} {self.outcomes.get(record["id"], "")}', width)
-            if state.tab != 'Screen':
-                entry = self.inspection.get((record['id'], state.tab.lower()), {})
-                self.lines(entry.get('text', 'Loading supported source…'), y + 4, x, max(1, height // 2 - 3), width, state.detail_scroll)
-                preview_y = y + max(5, height // 2 + 1)
-            else:
-                preview_y = y + min(5, max(2, height - 3))
-            self.render_capture(record, preview_y, x, y + height - preview_y, width, state.detail_scroll if state.tab == 'Screen' else 0)
+            offset = self.capture_offset(height, state.tab)
+            if height >= 8:
+                self.put(y + 1, x, ' | '.join(f'[{tab}]' if state.tab == tab else tab for tab in DETAIL_TABS), width)
+                self.put(y + 2, x, f'{fields.get("server", self.daemon.server)}/{fields.get("host", "?")}/{fields.get("session", "?")}/{fields.get("window", record["id"])}', width, curses.A_DIM)
+                self.put(y + 3, x, f'project:{self.project_name(record.get("project_id"))} state:{fields.get("state", "unknown")} {self.outcomes.get(record["id"], "")}', width)
+                if state.tab != 'Screen':
+                    entry = self.inspection.get((record['id'], state.tab.lower()), {})
+                    self.lines(entry.get('text', 'Loading supported source…'), y + 4, x, max(0, offset - 4), width, state.detail_scroll)
+            preview_y = y + offset
+            self.render_capture(record, preview_y, x, max(0, height - offset), width, state.detail_scroll if state.tab == 'Screen' else 0)
         else:
             text = self.content_text(record)
             self.lines(text, y + 1, x, height - 1, width, state.detail_scroll)
 
     def render_capture(self, target, y, x, height, width, offset=0):
+        if height <= 0 or width <= 0:
+            return
         if height < 2 or width < 12:
             self.put(y, x, 'Preview too small', width)
             return
@@ -921,7 +1004,7 @@ class Application:
                 self.opened = None
 
     def navigate(self, key, state, rows, detail=False):
-        height = max(1, self.screen.getmaxyx()[0] - 9)
+        height = max(1, self.viewport()[0] - 9)
         moves = {'j': 1, 'DOWN': 1, 'k': -1, 'UP': -1, 'd': max(1, height // 2), 'u': -max(1, height // 2),
             '\x06': height, 'PAGEDOWN': height, '\x02': -height, 'PAGEUP': -height,
             'g': -1000000, 'HOME': -1000000, 'G': 1000000, 'END': 1000000}
@@ -936,7 +1019,12 @@ class Application:
     def action(self, action):
         record = self.opened or self.selected()
         if action == 'ui.quit':
-            self.running = False
+            if self.daemon_hosted:
+                def detached(_, error):
+                    self.status = f'Detach failed: {error}' if error else 'Viewers detached; UI state preserved. Run cmtm to resume.'
+                self.submit_io('ui-detach', self.daemon.request_ui_detach, detached)
+            else:
+                self.running = False
         elif action == 'ui.palette':
             self.palette()
         elif action == 'ui.help':
@@ -1326,13 +1414,19 @@ class Application:
             self.focus_detail = True
 
     def live_size(self):
-        height, width = self.screen.getmaxyx()
-        cols = width if width < 60 else width - max(20, min(width // 2, 56))
-        return max(1, cols), max(1, height - 12)
+        return self.capture_size(live=True)
 
     def live(self, target):
         if not target or target['kind'] != 'window':
             raise ValueError('Select a real window for live interaction')
+        fields = target.get('fields', {})
+        inherited_window = os.environ.get('TUIOS_WINDOW_ID') or os.environ.get('TUIOS_PANE_ID')
+        if (self.daemon_hosted and fields.get('server', self.daemon.server) == self.daemon.server
+                and fields.get('host', 'local') in ('local', 'localhost', '')
+                and fields.get('session') == 'mtm-only'
+                and (str(fields.get('pid')) == str(os.getpid())
+                     or inherited_window and fields.get('window') == inherited_window)):
+            raise ValueError('The hosted cmtm manager is not a terminal/agent target; choose a work pane')
         if self.live_stream or self.live_transition:
             return
         self.live_transition = True
@@ -1556,15 +1650,26 @@ class Application:
     def palette(self):
         records = [make_record('route:new', 'New', route='new', hint='Terminal / Agent / Vim / Project / Context / Session'),
             make_record('route:selected', 'Selected item', route='selected', hint='Object-first actions')]
-        records += [make_record(action, meta['label'], action=action, hint=self.binding_for(action) + ' ' + meta.get('description', '')) for action, meta in concepts.ACTIONS.items()]
+        records += [make_record(action, meta['label'], action=action, hint=self.binding_for(action) + ' ' + meta.get('description', ''))
+            for action in concepts.ACTIONS for meta in (self.action_metadata(action),)]
         self.modals.append(Modal('Palette', 'palette', records, self.origin(), searching=True))
 
     def binding_for(self, action):
         return next((key for key, value in self.bindings.items() if value == action), '(unbound)')
 
+    def action_metadata(self, action):
+        metadata = concepts.ACTIONS[action]
+        if action != 'ui.quit':
+            return metadata
+        if self.daemon_hosted:
+            return {**metadata, 'label': 'Detach viewers',
+                'description': 'Detach all viewers of this shared UI; keep the UI process and state running. Run cmtm to resume. Ctrl+g then d detaches only your terminal.'}
+        return {**metadata, 'label': 'Quit', 'description': 'Exit this standalone UI; leave daemon and other windows running.'}
+
     def help(self):
         records = [make_record('help:' + action, f'{self.binding_for(action):12} {meta["label"]}', 'help',
-            description=meta.get('description', ''), hint=meta.get('description', '')) for action, meta in concepts.ACTIONS.items()]
+            description=meta.get('description', ''), hint=meta.get('description', ''))
+            for action in concepts.ACTIONS for meta in (self.action_metadata(action),)]
         records += [make_record('help:nav:' + key, key, 'help', hint=description, description=description) for key, description in [
             ('j/k or arrows', 'Move selection; in text editing letters insert normally'), ('h/l', 'Change list/detail focus; modal content stays cropped'),
             ('d/u, Ctrl+f/b', 'Half/full page; g/G reaches ends'), ('{/}', 'Previous/next page or section'),
@@ -1745,8 +1850,8 @@ class Application:
         self.form = Form(record['label'] + ' — discovered native operation', fields, submit, submit_label='Review confirmation')
 
 
-def run(services, json_data=None):
-    """Enter the interactive shell. JSON_NULL requests an explorer for JSON null."""
+def run(services, json_data=None, *, daemon_hosted=False):
+    """Enter the UI; hosted quit detaches viewers. JSON_NULL explores JSON null."""
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         raise RuntimeError('Interactive UI requires a terminal on stdin and stdout')
-    return curses.wrapper(lambda screen: Application(screen, services, json_data).run())
+    return curses.wrapper(lambda screen: Application(screen, services, json_data, daemon_hosted=daemon_hosted).run())

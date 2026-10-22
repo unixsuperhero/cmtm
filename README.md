@@ -12,11 +12,15 @@ Requires Python 3.11 or newer with curses and an installed `tuios` executable.
 bin/cmtm
 ```
 
-That's the complete startup command. It starts or reuses the detached `clean-mtm` daemon, creates a **new** UI window in `mtm-only`, and attaches your terminal. No `daemon start`, `bootstrap --attach`, or XDG environment setup is needed.
+That's the complete startup command. If `clean-mtm` is not running, cmtm starts the detached daemon and creates its UI in `mtm-only`. If the daemon is already running, cmtm attaches to the existing UI without creating windows or resetting its screen, selection, or drafts. No separate startup commands or XDG environment setup are needed.
+
+The UI has a persistent `cmtm` frame around all four edges of the terminal, including embedded terminal and agent interaction. The frame identifies normal versus live input; work stays inside it rather than replacing the application with a bare shell. Select a work window in Panes and press `i` for embedded live input. There is no separate public raw-target `live` shortcut.
 
 Run from this checkout, or install with `python3 -m pip install .` and run `cmtm` from anywhere. Only the `cmtm` executable is installed, so an existing `mtm` installation is not replaced. `python3 -m cmtm` does the same thing.
 
-Quit the UI with `q`, or detach from its viewer with `Ctrl+g` then `d`. The daemon and other managed windows keep running. Detaching also leaves the UI window running. Each subsequent `cmtm` invocation creates and attaches a fresh UI window. The outer viewer uses `Ctrl+g` so the UI's embedded-live `Ctrl+a` controls pass through unchanged.
+`q` detaches viewers from the shared UI without exiting it. `Ctrl+g` then `d` detaches only your terminal. The daemon, UI, and work windows keep running; the next `cmtm` resumes that same UI. The outer viewer uses `Ctrl+g` so embedded-live `Ctrl+a` controls pass through unchanged. Standalone JSON exploration still exits normally.
+
+If the daemon is running but its UI was explicitly closed or crashed, cmtm reports the missing UI instead of creating a replacement window. It never restarts that daemon or closes work windows automatically.
 
 ```sh
 python3 -m cmtm projects create Website
@@ -44,7 +48,7 @@ Put global `--server`, `--database`, and `--json` options before the command. Ou
 | `i` | Explicit live input to selected window |
 | `Ctrl+a` then `d` | Leave live mode without closing the target |
 | `Ctrl+s`, `F4` | Submit form / native path picker |
-| `q` | Exit client without stopping its daemon |
+| `q` | Detach shared UI viewers; preserve daemon, UI state and work |
 
 Jump/Context Escape returns one nesting level with its state intact. The command palette has separate search-first Escape behavior. Form editing preserves drafts; cancellation never creates vocabulary values or projects.
 
@@ -77,6 +81,8 @@ bash scripts/verify-vps.sh
 
 This copies a source snapshot to `vps2`, creates a disposable configuration directory and database, bounds the run to 120 seconds, and stops only its uniquely named test server. `CMTM_VERIFY_TIMEOUT` can select a deadline from 1 to 900 seconds. The snapshot retains `verification.log` and captured terminal output.
 
-Verified on Linux (`vps2`) with the installed TUIOS: cold plain-command startup despite active shared host links; unchanged shared configuration and restored shell configuration environment; automatic attachment and fresh UI creation on reuse; detach/quit with daemon and work-window survival; non-TTY startup refusal without resource creation; SQLite persistence and rollback; CLI dispatch; terminal input/capture; embedded live attach/detach; TUI project creation; nested navigation; context browsing; JSON exploration; and verified `mtm-only` placement.
+The acceptance scenario covers cold plain-command startup despite active shared host links; unchanged shared configuration and restored shell configuration environment; resuming the same manager identity, inventory, and Context page after detach; hosted `q` preserving the UI and allowing a later reattach; refusal to create a missing UI on an already-running daemon; all four full-screen frame edges in normal and embedded-live modes; non-TTY startup refusal without resource creation; SQLite persistence and rollback; CLI dispatch; terminal input/capture; TUI project creation; nested navigation; context browsing; JSON exploration; and verified `mtm-only` placement. The run retains `acceptance-manager-screen.txt` and `acceptance-live-screen.txt` alongside terminal recordings. These describe coverage, not a substitute for the recorded result of a run.
+
+Latest result: `bash scripts/verify-vps.sh` completed on Linux (`vps2`) with `ACCEPTANCE PASS`. The retained normal and embedded-live captures both filled a 100×28 terminal with intact cmtm borders on all four edges.
 
 Native macOS execution, desktop picker dialogs, and agent-provider authentication were not exercised. Remote mutations and unavailable model/effort/speed catalogs are explicitly rejected as described above.
