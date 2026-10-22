@@ -20,7 +20,7 @@ _ALIASES = {
 }
 _PERSISTENT = {"project", "context", "tag"}
 _LIVE = {"window", "session", "host"}
-_BUILTINS = {"tui", "json", "bootstrap", "settings", "daemon", "launch",
+_BUILTINS = {"json", "settings", "daemon", "launch",
              "capture", "send", "close", "live", "verbs", "call"}
 
 
@@ -48,16 +48,14 @@ def _globals(parser: argparse.ArgumentParser) -> None:
 
 
 def _parser(prog: str) -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog=prog, description="Manage an isolated TUIOS server. No automatic daemon startup.",
+    parser = argparse.ArgumentParser(prog=prog, description="Start or reuse an isolated TUIOS server, open a new UI window, and attach.",
         epilog="Unknown commands execute <invoked-name>-<command> from PATH. Put application global options before the command; external arguments are forwarded literally.")
     _globals(parser)
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    parser.add_argument("--internal-ui", action="store_true", help=argparse.SUPPRESS)
     commands = parser.add_subparsers(dest="command")
-    commands.add_parser("tui", help="open the UI in this terminal; never move the current session")
     viewer = commands.add_parser("json", help="explore JSON interactively; file, '-' for stdin, or a native picker")
     viewer.add_argument("file", nargs="?")
-    bootstrap = commands.add_parser("bootstrap", help="explicitly start isolated server and launch the UI in mtm-only")
-    bootstrap.add_argument("--attach", action="store_true", help="enter the created UI window after launch")
 
     names = set(concepts.CONCEPTS) | set(_ALIASES) | _PERSISTENT | _LIVE
     for name in sorted(names - _BUILTINS):
@@ -314,25 +312,26 @@ def _json_view(services: Any, filename: str | None) -> None:
 
 
 def _execute(services: Any, args: argparse.Namespace) -> Any:
-    command = args.command or "tui"
-    if command == "tui":
+    command = args.command
+    if args.internal_ui:
         from .ui import run
         run(services)
         return None
     if command == "json":
         _json_view(services, args.file)
         return None
-    if command == "bootstrap":
+    if command is None:
+        if not sys.stdin.isatty() or not sys.stdout.isatty():
+            raise ValueError("Launching the UI needs a terminal on stdin and stdout.")
         checkout_entry = Path(__file__).resolve().parent.parent / "bin" / "cmtm"
         entry = [str(checkout_entry)] if checkout_entry.is_file() else ["-m", "cmtm"]
         argv = [sys.executable, *entry, "--server", args.server]
         if args.database:
             argv.extend(("--database", str(Path(args.database).expanduser().resolve())))
-        argv.append("tui")
+        argv.append("--internal-ui")
         result = services.daemon.bootstrap(argv)
-        if args.attach:
-            services.daemon.live(result)
-        return result
+        services.daemon.live(result, leader="ctrl+g")
+        return None
     if hasattr(args, "kind") and command != "launch":
         return _records(services, args)
     if command == "settings":
@@ -449,6 +448,8 @@ def main(argv: list[str] | None = None) -> int:
         args.server = global_args.server
         args.database = global_args.database
         args.machine = global_args.machine
+        if args.internal_ui and args.command is not None:
+            parser.error("--internal-ui cannot be combined with a command")
         with open_services(server=args.server, database=args.database) as services:
             result = _execute(services, args)
         if result is not None:

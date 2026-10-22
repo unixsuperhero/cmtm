@@ -25,7 +25,7 @@ Embedded live mode uses `open_live(target,cols,rows)` and its handle's `send(byt
 
 Persist successful live-window ownership through `store.save_with_project(target['kind'], target['label'], fields=target['fields'], project=project, id=target['id'])`. `store.decorate(snapshot)` overlays saved ownership and flags without changing daemon state or inferring a project from a session name. `store.vocabulary(field,kind=None)` supplies completion values and `store.reassociate(id,project)` changes saved associations explicitly.
 
-`Services` in app has `.store`, `.daemon`, `.concepts` and `.settings` (dictionary). `app.open_services(server='clean-mtm',database=None)` returns services; `services.close()` releases them. Use the platform user-data directory dedicated to cmtm for default database. Do not start the daemon automatically.
+`Services` in app has `.store`, `.daemon`, `.concepts` and `.settings` (dictionary). `app.open_services(server='clean-mtm',database=None)` returns services; `services.close()` releases them without stopping the daemon. Use the platform user-data directory dedicated to cmtm for default database. Service construction does not start a daemon; the default CLI launch explicitly orchestrates start/reuse, creation of a new UI window in `mtm-only`, and attachment. Internal UI execution must not recursively launch another UI.
 
 `ui.run(services,json_data=None)` owns curses entry/exit. When json_data is not None, run the built-in JSON tree explorer without requiring daemon availability. UI must remain usable while daemon is disconnected. Background workers do bounded I/O; only the main curses thread renders. Reuse list/forms/modal behavior rather than one-off per-page copies.
 

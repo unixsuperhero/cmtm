@@ -22,7 +22,7 @@ def default_database() -> Path:
 
 
 class Services:
-    """Own one store and one isolated daemon client; never start a daemon implicitly."""
+    """Own one store and one isolated daemon client; startup is the CLI's responsibility."""
 
     def __init__(self, store: Store, daemon: Daemon) -> None:
         self.store = store

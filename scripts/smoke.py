@@ -26,6 +26,15 @@ def main():
     with tempfile.TemporaryDirectory(prefix="cmtm-smoke-") as directory:
         root = pathlib.Path(directory)
         database = root / "app.sqlite3"
+        config_home = root / "shared-config"
+        config_dirs = root / "shared-system-config"
+        shared_config = config_home / "tuios" / "config.toml"
+        shared_config.parent.mkdir(parents=True)
+        config_dirs.mkdir()
+        shared_text = '[hosts.cmtm_fixture]\naddr = "smoke@192.0.2.1"\n'
+        shared_config.write_text(shared_text)
+        os.environ["XDG_CONFIG_HOME"] = str(config_home)
+        os.environ["XDG_CONFIG_DIRS"] = str(config_dirs)
         env = dict(os.environ, TUIOS_SERVER="unrelated", TUIOS_SOCKET="/tmp/cmtm-do-not-use.sock", TERM="xterm-256color")
         base = [sys.executable, "-m", "cmtm", "--server", server, "--database", str(database)]
 
@@ -40,6 +49,7 @@ def main():
 
         help_result = cli("--help")
         assert "usage:" in help_result.stdout.lower() and not help_result.stdout.lstrip().startswith("{")
+        assert "terminal" in cli(success=False).stderr.lower(), "Noninteractive startup must fail before creating resources"
         cli("projects", "create", "Smoke project")
         cli("context", "create", "Durable context", "--project", "Smoke project", "--text", "saved source text")
         store = Store(database)
@@ -85,21 +95,24 @@ def main():
 
         daemon = Daemon(server)
         try:
-            daemon.start()
+            manager = startup_acceptance(base, env, daemon, detach=True)
+            assert shared_config.read_text() == shared_text, "Startup rewrote shared TUIOS config"
+            assert not any("cmtm_fixture" in str(row) for row in daemon.snapshot()), "Shared host auto-connect leaked into isolated daemon"
             target = daemon.launch("terminal", project="Smoke project", cwd=str(root), name="acceptance")
             assert target["fields"]["session"] == "Smoke project", target
             assert target["fields"]["server"] == server, target
             marker = "CMTM_ACCEPT_" + secrets.token_hex(4)
             # Split the literal so echoed command text cannot satisfy readiness.
-            daemon.send(target, "printf '%s%s\\n' '" + marker[:10] + "' '" + marker[10:] + "'\n")
+            daemon.send(target, "printf '%s%s\\n' '" + marker[:10] + "' '" + marker[10:] + "'; printf '%s\\n' \"$XDG_CONFIG_HOME\" \"$XDG_CONFIG_DIRS\"\n")
             deadline = time.monotonic() + 8
             screen = ""
             while time.monotonic() < deadline:
                 screen = daemon.capture(target, cols=100, rows=28)
-                if marker in screen:
+                if marker in screen and str(config_home) in screen and str(config_dirs) in screen:
                     break
                 time.sleep(0.05)
             assert marker in screen, screen
+            assert str(config_home) in screen and str(config_dirs) in screen, "Daemon isolation leaked private config into launched shell: " + screen
             assert any(row["id"] == target["id"] for row in daemon.snapshot()), "Launched target missing from inventory"
             (ROOT / "acceptance-screen.txt").write_text(screen)
             print("PASS isolated real terminal launch, session placement, input and read-only capture", flush=True)
@@ -123,26 +136,19 @@ def main():
             else:
                 raise AssertionError("Closed live stream accepted input")
             print("PASS real live stream input and closed-stream protection", flush=True)
-            ui_acceptance(base, env, root)
+            ui_acceptance(base + ["--internal-ui"], env, root)
             store = Store(database)
             assert any(row["label"] == "UI created project" for row in store.list("project")), "TUI form did not persist project"
             store.close()
             sample = root / "example.json"
             sample.write_text('{"items": [{"message": "JSON acceptance"}], "enabled": true}')
             ui_acceptance(base + ["json", str(sample)], env, root, json_mode=True)
-            manager = cli("bootstrap", machine=True)
-            assert manager["fields"]["session"] == "mtm-only", manager
-            deadline = time.monotonic() + 8
-            manager_screen = ""
-            while time.monotonic() < deadline:
-                manager_screen = daemon.capture(manager, cols=100, rows=28)
-                if "acceptance" in manager_screen and "connecting" not in manager_screen:
-                    break
-                time.sleep(0.05)
-            assert "acceptance" in manager_screen and "connecting" not in manager_screen, manager_screen
-            print("MANAGER SCREEN\n" + manager_screen, flush=True)
+            second_manager = startup_acceptance(base, env, daemon, detach=False)
+            assert second_manager["id"] != manager["id"], "Repeated launch reused an old UI"
+            survivors = {row["id"] for row in daemon.snapshot()}
+            assert manager["id"] in survivors and target["id"] in survivors, "Client exit closed unrelated managed windows"
             daemon.close_window(manager)
-            print("PASS actual manager UI running in mtm-only", flush=True)
+            print("PASS plain startup, new UI on reuse, detach/quit and daemon survival", flush=True)
             daemon.close_window(target)
             assert not any(row["id"] == target["id"] for row in daemon.snapshot()), "Closed target remains live"
             print("PASS explicit target closure", flush=True)
@@ -150,6 +156,70 @@ def main():
             daemon.close()
             subprocess.run(["tuios", "--server", server, "kill-server"], capture_output=True, timeout=8)
     print("ACCEPTANCE PASS", flush=True)
+
+
+def startup_acceptance(base, env, daemon, *, detach):
+    import fcntl
+    import pty
+    import select
+    import struct
+    import termios
+
+    try:
+        previous = {row["id"] for row in daemon.snapshot()}
+    except Exception:
+        previous = set()
+    if detach:
+        assert not previous, "Noninteractive/data commands unexpectedly started the daemon"
+    master, slave = pty.openpty()
+    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 28, 100, 0, 0))
+    process = subprocess.Popen(base, cwd=ROOT, env=env, stdin=slave, stdout=slave, stderr=slave, start_new_session=True)
+    os.close(slave)
+    output = bytearray()
+    manager = None
+    screen = ""
+    try:
+        deadline = time.monotonic() + 12
+        while time.monotonic() < deadline:
+            if select.select([master], [], [], 0.05)[0]:
+                try:
+                    output.extend(os.read(master, 65536))
+                except OSError:
+                    break
+            if process.poll() is not None:
+                break
+            try:
+                rows = daemon.snapshot()
+                fresh = [row for row in rows if row["kind"] == "window" and row["id"] not in previous and row["fields"].get("session") == "mtm-only"]
+                if fresh:
+                    assert len(fresh) == 1, "Default launch recursively created UI windows"
+                    manager = fresh[0]
+                    screen = daemon.capture(manager, cols=100, rows=28)
+                    if "manager placement: verified mtm-only" in screen and "current last OK" in screen and b"ctrl+g" in output:
+                        break
+            except Exception as exc:
+                if isinstance(exc, AssertionError):
+                    raise
+        assert manager is not None and "manager placement: verified mtm-only" in screen and "current last OK" in screen and b"ctrl+g" in output, (screen, bytes(output[-4000:]))
+        print("DEFAULT STARTUP SCREEN\n" + screen, flush=True)
+        os.write(master, b"\x07d" if detach else b"q")
+        process.wait(timeout=8)
+        assert process.returncode == 0, bytes(output[-4000:])
+        rows = daemon.snapshot()
+        if detach:
+            assert any(row["id"] == manager["id"] for row in rows), "Detach closed the UI window"
+        else:
+            assert not any(row["id"] == manager["id"] for row in rows), "Quitting left the manager window running"
+        return manager
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=3)
+        os.close(master)
 
 
 def ui_acceptance(base, env, root, json_mode=False):

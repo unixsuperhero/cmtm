@@ -4,6 +4,9 @@ The endpoint follows TUIOS internal/sockpath and internal/serverscope: named
 servers never search another socket directory. Remote links currently have no
 proven named-server selector and are deliberately not usable here. Test names
 use cmtm-t- plus six hexadecimal digits to fit TUIOS's 14-character limit.
+Startup uses a private, defaults-only TUIOS config beside the named socket.
+Only the startup process sees its XDG config roots; pane launchers restore the
+caller's config roots, leaving runtime, state, data and cmtm's database alone.
 """
 from __future__ import annotations
 
@@ -14,15 +17,16 @@ import os
 from pathlib import Path
 import re
 import select
+import shlex
 import shutil
 import socket
 import stat
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
-import tomllib
 import unicodedata
 from urllib.parse import quote
 
@@ -298,7 +302,7 @@ class Daemon:
         base = Path(runtime) / "tuios" if runtime else Path(f"/tmp/tuios-{os.getuid()}")
         self.socket_path = base / "servers" / server / "tuios.sock"
         self.state = "disconnected"
-        self.last_error = "Not connected; use Start explicitly if the named server is absent."
+        self.last_error = "Not connected; launch cmtm to start or reconnect to the named server."
         self.last_success = None
         self._lock = threading.RLock()
         self._connection = None
@@ -361,7 +365,7 @@ class Daemon:
         if verb in {"kill-session", "rename-session", "session-info", "list-windows", "new-window", "start-agent", "run-command", "set-option", "set-session-name", "set-session-space", "set-session-accent"} and not params.get("session"):
             raise DaemonError(f"{verb} requires an explicit session.", code="invalid_params")
         if verb == "apply-config":
-            self._check_start_config()
+            raise DaemonError("cmtm uses a private startup configuration; applying shared TUIOS configuration is not exposed.", code="isolation")
 
     def call(self, verb, params=None):
         """Return the native result object; never retry an ambiguous mutation."""
@@ -385,12 +389,13 @@ class Daemon:
                     self._disconnect(error)
                 raise
 
-    def _cli(self, args, timeout=10):
+    def _cli(self, args, timeout=10, *, environment=None):
         executable = shutil.which("tuios", path=self.environment.get("PATH"))
         if not executable:
             raise DaemonError("tuios is not installed on PATH.", code="unavailable")
         try:
-            result = subprocess.run([executable, "--server", self.server, *args], env=self.environment,
+            result = subprocess.run([executable, "--server", self.server, *args],
+                                    env=self.environment if environment is None else environment,
                                     stdin=subprocess.DEVNULL, capture_output=True, timeout=timeout, check=False)
         except (OSError, subprocess.TimeoutExpired) as error:
             raise DaemonError(f"Named TUIOS command failed: {error}", outcome="unknown") from error
@@ -400,55 +405,73 @@ class Daemon:
             raise DaemonError("TUIOS CLI result exceeds 16 MiB.", code="protocol")
         return result.stdout.decode(errors="replace")
 
-    def _check_start_config(self):
-        """Read TUIOS's own layer order; refuse active unisolated host links."""
+    def _pane_command(self, argv):
+        """Restore config discovery without replacing TUIOS's pane identity."""
+        command = ["/usr/bin/env"]
+        for key in ("XDG_CONFIG_HOME", "XDG_CONFIG_DIRS"):
+            if key not in self.environment:
+                command.extend(["-u", key])
+        command.extend(f"{key}={self.environment[key]}" for key in ("XDG_CONFIG_HOME", "XDG_CONFIG_DIRS")
+                       if key in self.environment)
+        return [*command, *argv]
+
+    def _prepare_start_config(self):
+        """Build a private defaults-only config, never importing shared hosts.
+
+        TUIOS has no per-file config selector. Its two config XDG variables
+        must therefore change for daemon startup, but not for nested cmtm or
+        launched tools. The configured shell restores them for ordinary panes;
+        explicit commands use _pane_command and agents use their env payload.
+        """
+        root = self.socket_path.parent / "cmtm-config"
         try:
-            report = json.loads(self._cli(["config", "files", "--json"]))
-        except (DaemonError, ValueError) as error:
-            if "there is no config file at " in str(error) and "tuios uses the defaults" in str(error):
-                return
-            raise DaemonError(f"Cannot establish safe daemon startup configuration: {error}", code="isolation") from error
-        if not isinstance(report, dict) or not isinstance(report.get("files"), list):
-            raise DaemonError("TUIOS did not report its configuration layers; startup refused.", code="isolation")
-        if report.get("warnings"):
-            raise DaemonError("TUIOS configuration has warnings; cannot establish isolated startup: " +
-                              "; ".join(map(str, report["warnings"])), code="isolation")
-        addresses = {}
-        for layer in report["files"]:
-            if layer.get("missing"):
-                continue
-            try:
-                with open(layer["path"], "rb") as source:
-                    raw = source.read(4 * 1024 * 1024 + 1)
-                if len(raw) > 4 * 1024 * 1024:
-                    raise ValueError("configuration layer exceeds 4 MiB")
-                document = tomllib.loads(raw.decode("utf-8"))
-                for name, host in document.get("hosts", {}).items():
-                    if not isinstance(host, dict):
-                        raise ValueError(f"hosts.{name} is not a table")
-                    if "addr" in host:
-                        addresses[name] = host["addr"]
-            except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
-                raise DaemonError(f"Cannot inspect TUIOS startup config safely: {error}", code="isolation") from error
-        active = sorted(name for name, address in addresses.items() if address and name != "*")
-        if active:
-            raise DaemonError(
-                "Startup refused: shared TUIOS config auto-connects host links (" + ", ".join(active) +
-                ") without a proven named-server selector. No daemon was started. Start cmtm with an explicitly isolated XDG_CONFIG_HOME and XDG_CONFIG_DIRS containing no active [hosts] addresses; cmtm never changes your existing config.",
-                code="isolation")
+            # The socket base can live beneath /tmp; refuse pre-existing
+            # symlinks or directories another user can populate.
+            for directory in (self.socket_path.parents[2], self.socket_path.parents[1],
+                              self.socket_path.parent, root, root / "tuios"):
+                directory.mkdir(mode=0o700, exist_ok=True)
+                info = directory.lstat()
+                if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid()
+                        or stat.S_IMODE(info.st_mode) != 0o700):
+                    raise DaemonError(f"Private TUIOS config requires a user-owned 0700 directory: {directory}", code="isolation")
+            shell = self.environment.get("SHELL") or "/bin/sh"
+            wrapper = "#!/bin/sh\n"
+            for key in ("XDG_CONFIG_HOME", "XDG_CONFIG_DIRS"):
+                wrapper += (f"export {key}={shlex.quote(self.environment[key])}\n"
+                            if key in self.environment else f"unset {key}\n")
+            wrapper += f"exec {shlex.quote(shell)} \"$@\"\n"
+            shell_path = root / "shell"
+            config = ("# Managed by cmtm; shared TUIOS configuration is not imported.\n"
+                      "[appearance]\npreferred_shell = " + json.dumps(str(shell_path)) + "\n")
+            for destination, content, mode in ((shell_path, wrapper, 0o700),
+                                               (root / "tuios" / "config.toml", config, 0o600)):
+                temporary = None
+                try:
+                    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=destination.parent,
+                                                     prefix=".cmtm-", delete=False) as output:
+                        temporary = Path(output.name)
+                        os.fchmod(output.fileno(), mode)
+                        output.write(content)
+                    os.replace(temporary, destination)
+                finally:
+                    if temporary is not None:
+                        temporary.unlink(missing_ok=True)
+        except OSError as error:
+            raise DaemonError(f"Cannot create private TUIOS startup config: {error}", code="isolation") from error
+        return {**self.environment, "XDG_CONFIG_HOME": str(root), "XDG_CONFIG_DIRS": str(root)}
 
     def start(self):
-        """Explicitly start only this server; no resources are killed on exit."""
+        """Start or reuse only this server; no resources are killed on exit."""
         try:
             return self.call("hello", {"client": "cmtm", "protocol": 1})
         except DaemonError as error:
             if error.code != "disconnected":
                 raise
-        self._check_start_config()
+        environment = self._prepare_start_config()
         # `new --detach` is TUIOS's supported bounded startup path. The initial
         # ordinary shell belongs in no-project, never in the UI-only session.
         try:
-            self._cli(["new", "no-project", "--detach"], timeout=15)
+            self._cli(["new", "no-project", "--detach"], timeout=15, environment=environment)
         except DaemonError as error:
             # Startup may have restored an existing no-project session, or a
             # concurrent explicit starter may have won. Only a successful read
@@ -696,13 +719,14 @@ class Daemon:
             params.update(agent=harness, args=args, ready_timeout=3000)
             if options.get("protocol"):
                 params["protocol"] = options["protocol"]
-            # PATH is the only caller environment an agent needs; TUIOS installs
-            # its own fresh server/session/pane identities in the child.
-            params["env"] = {"PATH": self.environment.get("PATH", os.defpath)}
+            # Agent env cannot unset a variable; empty XDG values select the
+            # same defaults as absent values. Never pass the private roots.
+            params["env"] = {"PATH": self.environment.get("PATH", os.defpath),
+                             **{key: self.environment.get(key, "")
+                                for key in ("XDG_CONFIG_HOME", "XDG_CONFIG_DIRS")}}
             result = self.call("start-agent", params)
         else:
-            if argv:
-                params["command"] = argv
+            params["command"] = self._pane_command(argv or [self.environment.get("SHELL") or "/bin/sh"])
             result = self.call("new-window", params)
         wid = result.get("window_id")
         if not wid:
@@ -725,8 +749,9 @@ class Daemon:
             raise DaemonError("UI bootstrap requires a nonempty argv list.", code="invalid_params")
         self.start()
         session, sid, workspace = self._placement("mtm-only", str(Path.home()), ui=True)
-        result = self.call("new-window", {"session": session, "name": "Matomeru", "command": argv,
-                                          "workspace": workspace, "focus": False, "cwd": str(Path.home())})
+        result = self.call("new-window", {"session": session, "name": "Matomeru", "command": self._pane_command(argv),
+                                          "workspace": workspace, "focus": False, "cwd": str(Path.home()),
+                                          "close_on_exit": True})
         record = self._window_record(result, session, sid)
         record["fields"].update(pane_kind="ui", kind="ui", project="no-project")
         return record

@@ -136,7 +136,7 @@ class Application:
         self.inventory, self.persisted = [], []
         self.revision = 0
         self.connection = 'JSON explorer' if self.json_mode else 'connecting'
-        self.placement = '' if self.json_mode else 'standalone/unverified; cmtm bootstrap --attach for mtm-only'
+        self.placement = '' if self.json_mode else 'manager placement: verifying mtm-only'
         self.last_success = None
         self.status = ''
         self.modals = []
@@ -254,7 +254,7 @@ class Application:
                 same_boundary = os.environ.get('TUIOS_SERVER') == self.daemon.server and os.environ.get('TUIOS_SOCKET') == str(getattr(self.daemon, 'socket_path', ''))
                 verified = same_boundary and any(record['kind'] == 'window' and record.get('fields', {}).get('window') == inherited_window
                     and record['fields'].get('session') == 'mtm-only' and str(record['fields'].get('pid')) == str(os.getpid()) for record in records)
-                self.placement = 'manager placement: verified mtm-only' if verified else 'standalone/unverified; cmtm bootstrap --attach for mtm-only'
+                self.placement = 'manager placement: verified mtm-only' if verified else 'standalone/unverified; run cmtm to open a managed UI'
                 self.last_success = time.time()
                 self.connection = 'current'
                 self.revision += 1

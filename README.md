@@ -9,18 +9,14 @@ The application uses the named server `clean-mtm`. It must never fall back to th
 Requires Python 3.11 or newer with curses and an installed `tuios` executable.
 
 ```sh
-python3 -m cmtm --help
-python3 -m cmtm
+bin/cmtm
 ```
 
-Run from this checkout, or install with `python3 -m pip install .` and use `cmtm`. Only the `cmtm` executable is installed, so an existing `mtm` installation is not replaced. The application does not silently start a daemon.
+That's the complete startup command. It starts or reuses the detached `clean-mtm` daemon, creates a **new** UI window in `mtm-only`, and attaches your terminal. No `daemon start`, `bootstrap --attach`, or XDG environment setup is needed.
 
-```sh
-python3 -m cmtm daemon start
-python3 -m cmtm bootstrap --attach
-```
+Run from this checkout, or install with `python3 -m pip install .` and run `cmtm` from anywhere. Only the `cmtm` executable is installed, so an existing `mtm` installation is not replaced. `python3 -m cmtm` does the same thing.
 
-`bootstrap` starts a UI window in the isolated server's `mtm-only` session. Running `python3 -m cmtm` directly opens the UI in the current terminal without moving that terminal into another daemon.
+Quit the UI with `q`, or detach from its viewer with `Ctrl+g` then `d`. The daemon and other managed windows keep running. Detaching also leaves the UI window running. Each subsequent `cmtm` invocation creates and attaches a fresh UI window. The outer viewer uses `Ctrl+g` so the UI's embedded-live `Ctrl+a` controls pass through unchanged.
 
 ```sh
 python3 -m cmtm projects create Website
@@ -65,7 +61,9 @@ The implementation uses the Python standard library rather than a separate servi
 
 Existing Matomeru databases and TUIOS default-server sessions are not application storage or test fixtures. Verification uses unique `cmtm-t-<six-hex-digits>` servers and temporary databases. The short names fit TUIOS's 14-character limit. Secrets remain in their owning tools.
 
-Context can be associated with projects or left projectless. This is not a task tracker or an automatic knowledge-extraction service. Remote operations currently refuse because the available host-link API does not establish separate named-server endpoints. Startup also refuses active remote host auto-follow configuration rather than letting a named daemon connect to the user's default remote hosts. It does not rewrite user configuration. If choosing a separate `XDG_CONFIG_HOME`, do so explicitly and account for its effect on launched programs.
+Context can be associated with projects or left projectless. This is not a task tracker or an automatic knowledge-extraction service. Remote operations currently refuse because the available host-link API does not establish separate named-server endpoints. The managed daemon uses private TUIOS configuration automatically instead of loading your shared host auto-connect links. Your existing TUIOS configuration remains unchanged, and ordinary launched programs retain their configuration environment.
+
+Private TUIOS configuration is generated under `cmtm-config` beside the selected named-server socket. Shared TUIOS customization is intentionally not imported. Existing running named daemons are reused, not reconfigured or restarted.
 
 Native file-picker support depends on the operating system and desktop tools; an unavailable picker is reported rather than silently replaced by manual path entry. Agent model, effort, and speed options require authoritative capability metadata; unsupported options are rejected instead of inventing harness flags.
 
@@ -79,6 +77,6 @@ bash scripts/verify-vps.sh
 
 This copies a source snapshot to `vps2`, creates a disposable configuration directory and database, bounds the run to 120 seconds, and stops only its uniquely named test server. `CMTM_VERIFY_TIMEOUT` can select a deadline from 1 to 900 seconds. The snapshot retains `verification.log` and captured terminal output.
 
-Verified on Linux (`vps2`) with the installed TUIOS: SQLite reopen persistence, project/context reassociation and rollback, renamed CLI dispatch and argument preservation, isolated terminal launch/input/capture, live-stream closure, keyboard-driven project creation, embedded live attach/detach, nested Jump navigation, context browsing, JSON exploration, and a live inventory with verified `mtm-only` placement. The complete verification command finished in 4.09 seconds; this is acceptance evidence, not a performance benchmark.
+Verified on Linux (`vps2`) with the installed TUIOS: cold plain-command startup despite active shared host links; unchanged shared configuration and restored shell configuration environment; automatic attachment and fresh UI creation on reuse; detach/quit with daemon and work-window survival; non-TTY startup refusal without resource creation; SQLite persistence and rollback; CLI dispatch; terminal input/capture; embedded live attach/detach; TUI project creation; nested navigation; context browsing; JSON exploration; and verified `mtm-only` placement.
 
 Native macOS execution, desktop picker dialogs, and agent-provider authentication were not exercised. Remote mutations and unavailable model/effort/speed catalogs are explicitly rejected as described above.
